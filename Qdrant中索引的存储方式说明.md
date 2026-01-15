@@ -10,6 +10,29 @@ Qdrant 中的索引主要分为两大类：
 - **内存存储（RAM）**：索引数据完全加载到内存中，访问速度快，但占用内存
 - **磁盘存储（Disk/Mmap）**：索引数据存储在磁盘上，通过内存映射（mmap）访问，节省内存，但访问速度相对较慢
 
+## 历史版本说明
+
+### 早期版本（使用 RocksDB）
+
+在早期版本中，当使用 RocksDB 作为向量和 payload 的存储引擎时：
+
+1. **HNSW 索引**：**始终存储在独立的文件中**，不存储在 RocksDB 中
+   - 存储位置：segment 目录下的 `index/` 子目录
+   - 存储文件：`graph.bin` 和 `links.bin`（或压缩版本）
+   - **与是否使用 RocksDB 无关**
+
+2. **Payload 索引**：**存储在 RocksDB 的列族（Column Family）中**
+   - 每个字段的索引对应一个列族
+   - 列族命名规则：
+     - 数值索引：`{field}_numeric`
+     - Map 索引：`{field}_map`
+     - Geo 索引：`{field}_geo`
+     - 全文索引：`{field}_text`
+   - 索引数据在内存中构建，然后序列化存储到 RocksDB
+   - 加载时，从 RocksDB 读取数据并重建内存索引
+
+**注意**：Qdrant 正在逐步迁移远离 RocksDB，新版本默认使用 mmap 存储。
+
 ---
 
 ## 1. HNSW 索引存储
@@ -396,7 +419,171 @@ HNSW 索引支持三种压缩格式：
 
 ---
 
-## 6. 总结
+## 6. 早期版本中的 RocksDB 索引存储
+
+### 6.1 HNSW 索引（与 RocksDB 无关）
+
+**重要**：HNSW 索引的存储方式与是否使用 RocksDB **完全无关**。无论向量和 payload 数据存储在 RocksDB 还是 mmap 中，HNSW 索引都存储在独立的文件中。
+
+**存储位置**：
+- segment 目录下的 `index/` 子目录
+- 文件：`graph.bin` 和 `links.bin`（或压缩版本）
+
+**原因**：
+- HNSW 图结构不适合存储在键值数据库中
+- 需要高效的随机访问和遍历
+- 文件存储提供更好的性能
+
+### 6.2 Payload 索引（存储在 RocksDB 列族中）
+
+在早期版本中，当使用 RocksDB 时，payload 索引存储在 RocksDB 的列族中。
+
+#### 6.2.1 存储结构
+
+```rust
+// 数值索引存储在列族中
+fn numeric_index_storage_cf_name(field: &str) -> String {
+    format!("{field}_numeric")
+}
+
+// Map 索引存储在列族中
+pub fn storage_cf_name(field: &str) -> String {
+    format!("{field}_map")
+}
+
+// Geo 索引存储在列族中
+fn storage_cf_name(field: &str) -> String {
+    format!("{field}_geo")
+}
+```
+
+**位置**: 
+- `lib/segment/src/index/field_index/numeric_index/mod.rs:1248`
+- `lib/segment/src/index/field_index/map_index/mod.rs:278`
+- `lib/segment/src/index/field_index/geo_index/mod.rs:172`
+
+#### 6.2.2 存储方式
+
+**数值索引**：
+```rust
+/// Open and load mutable numeric index from RocksDB storage
+pub fn open_rocksdb(
+    db: Arc<RwLock<DB>>,
+    field: &str,
+    create_if_missing: bool,
+) -> OperationResult<Option<Self>> {
+    let store_cf_name = super::numeric_index_storage_cf_name(field);
+    let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(
+        DatabaseColumnWrapper::new(db, &store_cf_name)
+    );
+    // Load in-memory index from RocksDB
+    let in_memory_index = db_wrapper
+        .lock_db()
+        .iter()?
+        .map(|(key, value)| {
+            // 从 RocksDB 键值对重建内存索引
+            let value_idx = u32::from_be_bytes(value.as_ref().try_into()?);
+            let (idx, value) = T::decode_key(&key);
+            Ok((idx, value))
+        })
+        .collect::<Result<InMemoryNumericIndex<_>, OperationError>>()?;
+    // ...
+}
+```
+
+**位置**: `lib/segment/src/index/field_index/numeric_index/mutable_numeric_index.rs:249-301`
+
+**Map 索引**：
+```rust
+/// Open mutable map index from RocksDB storage
+pub fn open_rocksdb(
+    db: Arc<RwLock<DB>>,
+    field_name: &str,
+    create_if_missing: bool,
+) -> OperationResult<Option<Self>> {
+    let store_cf_name = MapIndex::<N>::storage_cf_name(field_name);
+    // Load in-memory index from RocksDB
+    let mut map = HashMap::<_, RoaringBitmap>::new();
+    let mut point_to_values = Vec::new();
+    for (record, _) in db_wrapper.lock_db().iter()? {
+        let (value, idx) = MapIndex::<N>::decode_db_record(record)?;
+        // 重建内存索引
+        // ...
+    }
+    // ...
+}
+```
+
+**位置**: `lib/segment/src/index/field_index/map_index/mutable_map_index.rs:65-120`
+
+#### 6.2.3 索引选择器
+
+Qdrant 使用 `IndexSelector` 来根据存储类型选择索引实现：
+
+```rust
+pub enum IndexSelector<'a> {
+    /// In-memory index on RocksDB, appendable or non-appendable
+    #[cfg(feature = "rocksdb")]
+    RocksDb(IndexSelectorRocksDb<'a>),
+    /// On disk or in-memory index on mmaps, non-appendable
+    Mmap(IndexSelectorMmap<'a>),
+    /// In-memory index on gridstore, appendable
+    Gridstore(IndexSelectorGridstore<'a>),
+}
+
+#[cfg(feature = "rocksdb")]
+pub struct IndexSelectorRocksDb<'a> {
+    pub db: &'a Arc<parking_lot::RwLock<rocksdb::DB>>,
+    pub is_appendable: bool,
+}
+```
+
+**位置**: `lib/segment/src/index/field_index/index_selector.rs:30-47`
+
+#### 6.2.4 迁移策略
+
+Qdrant 提供了从 RocksDB 索引迁移到 mmap 索引的机制：
+
+```rust
+// Actively migrate away from RocksDB indices
+#[cfg(feature = "rocksdb")]
+if common::flags::feature_flags().migrate_rocksdb_payload_indices
+    && indexes.iter().any(|index| index.is_rocksdb())
+{
+    log::info!("Migrating away from RocksDB indices for field `{field}`");
+    // 迁移逻辑...
+}
+```
+
+**位置**: `lib/segment/src/index/struct_payload_index.rs:250-273`
+
+### 6.3 存储对比
+
+| 索引类型 | 早期版本（RocksDB） | 新版本（Mmap） |
+|---------|-------------------|---------------|
+| **HNSW 索引** | 独立文件（`graph.bin`, `links.bin`） | 独立文件（`graph.bin`, `links.bin`） |
+| **Payload 索引** | RocksDB 列族 | Mmap 文件 |
+| **存储位置** | RocksDB 数据库 | 文件系统 |
+| **访问方式** | 通过 RocksDB API | 通过 mmap |
+| **内存使用** | 加载到内存 | 按需加载 |
+
+### 6.4 为什么 HNSW 索引不存储在 RocksDB 中？
+
+1. **访问模式不匹配**：
+   - HNSW 图需要高效的随机访问和遍历
+   - RocksDB 的键值访问模式不适合图遍历
+
+2. **性能考虑**：
+   - 文件存储提供更好的顺序和随机访问性能
+   - mmap 提供零拷贝访问
+
+3. **独立性**：
+   - HNSW 索引的存储与向量和 payload 的存储方式无关
+   - 可以独立优化和扩展
+
+---
+
+## 7. 总结
 
 Qdrant 中的索引存储采用以下策略：
 
@@ -406,7 +593,8 @@ Qdrant 中的索引存储采用以下策略：
    - 默认使用内存存储以获得最佳性能
 
 2. **Payload 索引**：
-   - 统一使用 mmap 存储
+   - **早期版本**：存储在 RocksDB 的列族中
+   - **新版本**：统一使用 mmap 存储
    - 支持按需加载和预加载两种模式
    - 通过 `populate` 参数控制
 
@@ -414,5 +602,10 @@ Qdrant 中的索引存储采用以下策略：
    - 使用内存映射（mmap）实现零拷贝访问
    - 使用 `madvise` 优化内存访问模式
    - 支持多种压缩格式以节省存储空间
+
+4. **迁移策略**：
+   - Qdrant 正在逐步迁移远离 RocksDB
+   - 提供了自动迁移机制
+   - 新部署默认使用 mmap 存储
 
 这种设计使得 Qdrant 能够在内存和磁盘之间灵活平衡，既保证了性能，又支持大规模数据的存储。
